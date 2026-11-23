@@ -10,10 +10,11 @@
 # Usage: vng.sh [--boots N] [--cpus N] [--host-cpus LIST] TREE [TREE...] [-- veth_wake.sh options]
 #
 # --host-cpus pins the VM to host CPUs, e.g. 8-15, so that other load on
-# the host disturbs it less. Give it more host CPUs than --cpus, as qemu's
-# own threads otherwise preempt busy vCPUs for milliseconds, which shows
-# up as ping spikes. Their frequency governor should be performance, see
-# bench-mode.sh, which also keeps everything else off them.
+# the host disturbs it less. The first --cpus of them run one vCPU each,
+# the rest run qemu's own threads, which otherwise preempt busy vCPUs for
+# milliseconds. So give it more host CPUs than --cpus. Their frequency
+# governor should be performance, see bench-mode.sh, which also keeps
+# everything else off them.
 #
 # Examples:
 #   ./vng.sh ~/net-next -- --stress
@@ -78,11 +79,20 @@ if [ -n "$HOST_CPUS" ]; then
 		[ -r "$g" ] && [ "$(cat "$g")" != performance ] &&
 			echo "warning: host CPU $c uses the $(cat "$g") governor" >&2
 	done
-	[ "$(echo $HOST_LIST | wc -w)" -gt "$CPUS" ] ||
+	if [ "$(echo $HOST_LIST | wc -w)" -gt "$CPUS" ]; then
+		VCPU_LIST=$(printf '%s\n' $HOST_LIST | head -n "$CPUS" | paste -sd,)
+		QEMU_LIST=$(printf '%s\n' $HOST_LIST | tail -n +$((CPUS + 1)) | paste -sd,)
+		echo "vCPUs on host CPUs $VCPU_LIST, qemu threads on $QEMU_LIST"
+		PIN_CMD=(taskset -c "$QEMU_LIST")
+		PIN_ARGS=(--pin "$VCPU_LIST")
+	else
 		echo "warning: --host-cpus should have more CPUs than --cpus $CPUS" >&2
-	PIN_CMD=(taskset -c "$HOST_CPUS")
+		PIN_CMD=(taskset -c "$HOST_CPUS")
+		PIN_ARGS=()
+	fi
 else
 	PIN_CMD=()
+	PIN_ARGS=()
 	echo "warning: the VM is not pinned to host CPUs (--host-cpus)" >&2
 fi
 
@@ -107,7 +117,8 @@ for i in "${!TREES[@]}"; do
 		"$(sha256sum < "$t/.config" | cut -c1-12)"
 done | tee "$OUT/kernels"
 
-KERNEL_BAD='BUG:|WARNING:|Oops|Kernel panic|NETDEV WATCHDOG'
+# Console lines only, vng prints its own warnings without a timestamp
+KERNEL_BAD='^\[ *[0-9]+\.[0-9]+\] .*(BUG:|WARNING:|Oops|Kernel panic|NETDEV WATCHDOG)'
 FAIL=0
 
 for ((b = 1; b <= BOOTS; b++)); do
@@ -115,7 +126,7 @@ for ((b = 1; b <= BOOTS; b++)); do
 		name=${LABELS[$i]}-$b
 		echo "=== boot $b/$BOOTS: ${LABELS[$i]} (${TREES[$i]})"
 		(cd "${TREES[$i]}" &&
-		 "${PIN_CMD[@]}" vng --verbose --cpus "$CPUS" --memory 2G \
+		 "${PIN_CMD[@]}" vng --verbose --cpus "$CPUS" "${PIN_ARGS[@]}" --memory 2G \
 			--rwdir "$OUT" --append "panic=5 loglevel=5" \
 			--exec "$DIR/veth_wake.sh --label ${LABELS[$i]} --csv $CSV$ARGS") \
 			2>&1 | tee "$OUT/$name.log"
