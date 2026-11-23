@@ -130,13 +130,15 @@ on() {
 }
 
 off() {
-	local c gov min max epp idle i s irq list
+	local c gov min max epp idle i s irq list procs
 
 	[ -e "$STATE" ] || die "not on"
 	CPUS=$(cat "$STATE/cpus")
 	if [ -d "$CG" ]; then
-		[ -s "$CG/cgroup.procs" ] &&
-			die "still running in the partition: $(paste -sd' ' "$CG/cgroup.procs")"
+		# cgroup files have size 0, so read them instead of test -s
+		procs=$(paste -sd' ' "$CG/cgroup.procs")
+		[ -n "$procs" ] &&
+			die "still running in the partition: $procs, for the queue: touch queue/stop"
 		echo member > "$CG/cpuset.cpus.partition"
 		rmdir "$CG" || die "cannot remove $CG"
 	fi
