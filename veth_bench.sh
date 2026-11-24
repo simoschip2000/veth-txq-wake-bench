@@ -1,20 +1,22 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# veth txq wake benchmark. Run as root on the kernel under test, in a VM or
-# under virtme-ng (see vng.sh).
+# veth-bench: veth benchmark and stress check. Run as root on the kernel
+# under test, in a VM or under virtme-ng (see vng.sh).
 #
 # Sets up a veth pair with GRO on and TSO off, so that every packet takes
 # the NAPI ptr_ring path. When the ring is full, veth stops the txq of the
 # sender and its NAPI wakes it again. pktgen floods the qdisc of veth_tw0.
 #
-# Every --napi mode is run --runs times and gives one result line. --iperf measures iperf3 TCP and 64 byte UDP throughput
-# instead, with noqueue in softirq NAPI and with --qdisc in each --napi
-# mode. At the end of every run the peer's NAPI is deleted and re-added
-# under traffic, and ping must still get through.
+# Every --napi mode is run --runs times and gives one result line.
+# --iperf measures iperf3 TCP and 64 byte UDP throughput instead, with
+# noqueue in softirq NAPI and with --qdisc in each --napi mode. At the end
+# of every run the peer's NAPI is deleted and re-added under traffic, and
+# ping must still get through.
 #
 # --queues N gives the pair N queues, an mq root with --qdisc per queue and
-# one pktgen thread or iperf3 stream per queue.
+# one pktgen thread per queue. --streams S runs S iperf3 clients and
+# servers, by default one per queue.
 #
 # --stress changes qdisc, channels and the peer's NAPI under traffic, then
 # deletes the link with packets in flight.

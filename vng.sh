@@ -1,13 +1,13 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Boot one or more built kernel trees under virtme-ng and run veth_wake.sh
+# Boot one or more built kernel trees under virtme-ng and run veth_bench.sh
 # in each boot. With several trees the boots alternate, so that drift on the
 # host hits both kernels alike. Results and logs, with kernel warnings and
 # worse from the console, go to results/<timestamp>/, followed by the
 # averages of all boots.
 #
-# Usage: vng.sh [--boots N] [--cpus N] [--host-cpus LIST] TREE [TREE...] [-- veth_wake.sh options]
+# Usage: vng.sh [--boots N] [--cpus N] [--host-cpus LIST] TREE [TREE...] [-- veth_bench.sh options]
 #
 # --host-cpus pins the VM to host CPUs, e.g. 8-15, so that other load on
 # the host disturbs it less. The first --cpus of them run one vCPU each,
@@ -128,7 +128,7 @@ for ((b = 1; b <= BOOTS; b++)); do
 		(cd "${TREES[$i]}" &&
 		 "${PIN_CMD[@]}" vng --verbose --cpus "$CPUS" "${PIN_ARGS[@]}" --memory 2G \
 			--rwdir "$OUT" --append "panic=5 loglevel=5" \
-			--exec "$DIR/veth_wake.sh --label ${LABELS[$i]} --csv $CSV$ARGS") \
+			--exec "$DIR/veth_bench.sh --label ${LABELS[$i]} --csv $CSV$ARGS") \
 			2>&1 | tee "$OUT/$name.log"
 		rc=${PIPESTATUS[0]}
 		# --verbose puts the console, warnings and worse, into the log
@@ -142,7 +142,7 @@ done
 
 if [ -s "$CSV" ]; then
 	echo
-	"$DIR/veth_wake.sh" --summary "$CSV" | tee "$OUT/summary.txt"
+	"$DIR/veth_bench.sh" --summary "$CSV" | tee "$OUT/summary.txt"
 fi
 echo "Results: $OUT"
 exit $FAIL
