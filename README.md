@@ -12,8 +12,7 @@ consumer wakes the sender's txq and how the sender stops it.
 
 `veth_wake.sh` creates a veth pair with GRO on and TSO off, so every
 packet takes the NAPI ptr_ring path. When the ring is full, veth stops
-the sender's txq and its NAPI wakes it again. pktgen floods the qdisc,
-and iptables rules in the peer netns slow down the consumer.
+the sender's txq and its NAPI wakes it again. pktgen floods the qdisc.
 
 It has three modes:
 
@@ -28,27 +27,37 @@ It has three modes:
 At the end of every benchmark and iperf run the peer's NAPI is deleted and
 re-added under a pktgen flood (GRO off and on, peer down and up), and ping
 must still get through after each step, so a txq that stays stopped
-fails the run. All modes fail on a stall or a kernel BUG/WARNING.
+fails the run. The log then shows the peer's receive rate, the qdisc
+backlog, the neighbor entries and whether ping gets through within
+another 20 s. All modes fail on a stall or a kernel BUG/WARNING.
 
-Producer, iperf3 server, NAPI threads and ping are pinned to their own
-CPUs, which needs 4 CPUs, or 2N+2 with `--queues N`. `--no-pin` turns
-that off. With softirq NAPI the consumer runs on the producer's CPU, so
-the ring rarely fills there. Those cases check for regressions.
+Producers, iperf3 servers, NAPI threads and ping are pinned to their own
+CPUs. With N queues and S iperf3 streams that needs 2S+N+1 CPUs, 4 for
+the defaults. `--no-pin` turns that off. With softirq NAPI and a single
+sender the consumer runs on the sender's CPU, so the ring rarely fills
+there. Those cases check for regressions.
 
 `--queues N` gives the pair N queues with an mq root and `--qdisc` per
-queue, and uses N pktgen threads or iperf3 streams.
+queue, and uses N pktgen threads. `--streams S` runs S iperf3 clients
+and servers, one per CPU, by default one per queue. With several queues
+XPS sends stream i through queue i modulo N. With one queue all streams
+share its qdisc, ring and NAPI, so the ring fills with softirq NAPI too:
 
-It needs only bash, iproute2, ethtool, iptables, ping, procps, util-linux
-and a kernel with `CONFIG_VETH`, `CONFIG_NET_PKTGEN`, the qdisc under test
-and iptables support. `--iperf` also needs iperf3.
+```bash
+./vng.sh --cpus 6 --host-cpus 8-15 ~/base ~/wake -- --iperf --streams 2
+```
+
+It needs only bash, iproute2, ethtool, ping, procps, util-linux and a
+kernel with `CONFIG_VETH`, `CONFIG_NET_PKTGEN` and the qdisc under test.
+`--iperf` also needs iperf3.
 
 ## In a VM
 
 Copy `veth_wake.sh` into the VM and run it as root:
 
 ```bash
-./veth_wake.sh                                  # fq_codel, 0 rules, 20 s
-./veth_wake.sh --runs 5 --nrules "0 1000" --napi threaded --csv out.csv
+./veth_wake.sh                                  # fq_codel, 20 s
+./veth_wake.sh --runs 5 --napi threaded --csv out.csv
 ./veth_wake.sh --iperf --duration 10 --runs 5 --csv iperf.csv
 ./veth_wake.sh --stress
 ./veth_wake.sh --summary out.csv
@@ -67,7 +76,7 @@ preempt busy vCPUs for milliseconds:
 
 ```bash
 ./vng.sh ~/net-next -- --stress
-./vng.sh --boots 10 --host-cpus 8-15 ~/base ~/wake ~/stop -- --runs 2 --nrules "0 1000"
+./vng.sh --boots 10 --host-cpus 8-15 ~/base ~/wake ~/stop -- --runs 2
 ./vng.sh --boots 10 --host-cpus 8-15 ~/base ~/wake ~/stop -- --iperf --duration 10
 ```
 

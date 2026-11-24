@@ -6,11 +6,9 @@
 #
 # Sets up a veth pair with GRO on and TSO off, so that every packet takes
 # the NAPI ptr_ring path. When the ring is full, veth stops the txq of the
-# sender and its NAPI wakes it again. pktgen floods the qdisc of veth_tw0
-# and iptables rules in the peer netns slow down the consumer.
+# sender and its NAPI wakes it again. pktgen floods the qdisc of veth_tw0.
 #
-# Every combination of --napi and --nrules is run --runs times and gives
-# one result line. --iperf measures iperf3 TCP and 64 byte UDP throughput
+# Every --napi mode is run --runs times and gives one result line. --iperf measures iperf3 TCP and 64 byte UDP throughput
 # instead, with noqueue in softirq NAPI and with --qdisc in each --napi
 # mode. At the end of every run the peer's NAPI is deleted and re-added
 # under traffic, and ping must still get through.
@@ -29,10 +27,10 @@ exec 2>&1
 
 DURATION=20
 QDISC=fq_codel
-NRULES=0
 NAPI="threaded softirq"
 RUNS=1
 QUEUES=1
+STREAMS=
 PKT_SIZE=64
 LABEL=$(uname -r)
 CSV=
@@ -49,9 +47,10 @@ BOOT=$(cut -c1-8 /proc/sys/kernel/random/boot_id)
 PG_PID=
 FAIL=0
 
-# CPUs when pinned, for N queues: ping and the NAPI of veth_tw0 (replies)
-# on 0, the producers on 1..N, the iperf3 server on N+1 and the NAPI
-# threads of veth_tw1 on N+2..2N+1. Softirq NAPI runs on the producer's CPU.
+# CPUs when pinned, for N queues and S iperf3 streams: ping and the NAPI
+# of veth_tw0 (replies) on 0, the producers on 1..S (pktgen: 1..N), the
+# iperf3 servers on S+1..2S and the NAPI threads of veth_tw1 on 2S+1..2S+N.
+# Softirq NAPI runs on the producer's CPU.
 CPU_PING=0
 CPU_TX=1
 
@@ -60,10 +59,11 @@ usage() {
 Usage: $0 [options]
   --duration SEC      traffic time per run (default $DURATION)
   --qdisc NAME        qdisc on both ends (default $QDISC)
-  --nrules "N ..."    iptables rules in the peer netns (default $NRULES)
   --napi "MODE ..."   threaded and/or softirq NAPI (default "$NAPI")
   --runs N            runs of every combination (default $RUNS)
-  --queues N          queues, pktgen threads and iperf3 streams (default 1)
+  --queues N          queues and pktgen threads (default 1)
+  --streams N         iperf3 streams, each with its own client and server
+                      (default: one per queue)
   --size N            pktgen packet size (default $PKT_SIZE)
   --no-pin            do not pin producer, consumer and ping to CPUs
   --label STR         kernel name in the results (default uname -r)
@@ -277,11 +277,11 @@ set_qdisc() {
 	done
 }
 
-# usage: setup <queues> <nrules> <threaded|softirq> [qdisc]
+# usage: setup <queues> <threaded|softirq> [qdisc]
 setup() {
-	local qdisc=${4:-$QDISC} threaded=0
+	local qdisc=${3:-$QDISC} threaded=0
 
-	[ "$3" = threaded ] && threaded=1
+	[ "$2" = threaded ] && threaded=1
 	ip netns add "$NS" || die "cannot create netns"
 	ip link add "$A" numtxqueues "$1" numrxqueues "$1" type veth \
 		peer name "$B" numtxqueues "$1" numrxqueues "$1" netns "$NS" ||
@@ -300,21 +300,14 @@ setup() {
 
 	set_qdisc "$A" "$qdisc" || die "cannot install $qdisc"
 	set_qdisc "$B" "$qdisc" "$NS"
-
-	[ "$2" -gt 0 ] || return 0
-	{
-		echo "*filter"
-		for ((i = 0; i < $2; i++)); do
-			echo "-A INPUT -d $IP_B"
-		done
-		echo COMMIT
-	} | nsx iptables-restore || die "iptables-restore failed"
 }
 
 teardown() {
 	pktgen_stop
-	[ -s "$TMP/iperf.pid" ] && kill "$(cat "$TMP/iperf.pid")" 2>/dev/null
-	rm -f "$TMP/iperf.pid"
+	for f in "$TMP"/iperf*.pid; do
+		[ -s "$f" ] && kill "$(cat "$f")" 2>/dev/null
+		rm -f "$f"
+	done
 	ip link del "$A" 2>/dev/null
 	ip netns del "$NS" 2>/dev/null
 }
@@ -363,6 +356,37 @@ channels() {
 	pktgen_start
 }
 
+pktgen_sofar() {
+	sed -n 's/.*pkts-sofar: \([0-9]*\).*/\1/p' "$PG/$A@$CPU_TX" 2>/dev/null |
+		head -1
+}
+
+# Why ping failed. If pktgen still sends but the peer receives nothing
+# while the qdisc holds a backlog, the txq stays stopped. If the peer
+# still receives, look at the neighbor entries for ping and its replies.
+ping_diag() {
+	local rx0 rx1 pg0 pg1
+
+	rx0=$(nsx cat /sys/class/net/$B/statistics/rx_packets)
+	pg0=$(pktgen_sofar)
+	sleep 1
+	rx1=$(nsx cat /sys/class/net/$B/statistics/rx_packets)
+	pg1=$(pktgen_sofar)
+	echo "  peer rx: $((rx1 - rx0)) packets/s," \
+	     "pktgen sent: $(( ${pg1:-0} - ${pg0:-0} )) packets/s"
+	echo "  link: $(ip -br link show dev "$A" | awk '{print $1, $2}')," \
+	     "peer $(nsx ip -br link show dev "$B" | awk '{print $1, $2}')"
+	tc -s qdisc show dev "$A" | sed 's/^/  qdisc: /'
+	ip neigh show dev "$A" | sed 's/^/  neigh: /'
+	nsx ip neigh show dev "$B" | sed 's/^/  peer neigh: /'
+	echo "  peer NAPI threads: $(pgrep -c '^napi/veth_tw1')"
+	if ping -n -q -c 1 -i 0.05 -w 20 "$IP_B" >/dev/null 2>&1; then
+		echo "  ping got a reply within another 20 s"
+	else
+		echo "  still no ping reply after another 20 s"
+	fi
+}
+
 # Delete and re-add the peer's NAPI under a pktgen flood. Ping must still
 # get a reply within 10 s after every step, so the txq must not stay
 # stopped. A tail drop qdisc like pfifo drops most pings and the ARP after
@@ -376,6 +400,7 @@ end_checks() {
 		$step || echo "  (failed: $step)"
 		if ! ping -n -q -c 1 -i 0.05 -w 10 "$IP_B" >/dev/null 2>&1; then
 			echo "FAIL: no ping reply after $step" >&2
+			ping_diag >&2
 			FAIL=1
 		fi
 	done
@@ -388,11 +413,11 @@ qdisc_requeues() {
 	tc -s qdisc show dev "$A" | sed -n 's/.* requeues \([0-9]*\)).*/\1/p' | head -1
 }
 
-# usage: run_one <run> <nrules> <threaded|softirq>
+# usage: run_one <run> <threaded|softirq>
 run_one() {
 	local rx0 rx1 t0 t1 pps drops requeues
 
-	setup "$QUEUES" "$2" "$3"
+	setup "$QUEUES" "$2"
 	dmesg_mark
 	pktgen_start
 	sleep 1
@@ -409,65 +434,132 @@ run_one() {
 	dmesg_check
 
 	pps=$(( (rx1 - rx0) * 1000000000 / (t1 - t0) ))
-	printf "%-20s %-9s %2s %-8s %6s %4s %10s %10s %9s\n" \
-		"$LABEL" "$QDISC" "$QUEUES" "$3" "$2" "$1" "$pps" \
+	printf "%-20s %-9s %2s %-8s %4s %10s %10s %9s\n" \
+		"$LABEL" "$QDISC" "$QUEUES" "$2" "$1" "$pps" \
 		"${drops:--}" "${requeues:--}"
-	[ -n "$CSV" ] && echo "$LABEL,$QDISC,$QUEUES,$3,$2,$1,$BOOT,$pps,$drops,$requeues" >> "$CSV"
+	[ -n "$CSV" ] && echo "$LABEL,$QDISC,$QUEUES,$2,$1,$BOOT,$pps,$drops,$requeues" >> "$CSV"
 	return 0
 }
 
 benchmark() {
-	local r n nr
+	local r n
 
-	csv_header "kernel,qdisc,queues,napi,nrules,run,boot,pps,qdisc_drops,requeues"
-	printf "%-20s %-9s %2s %-8s %6s %4s %10s %10s %9s\n" \
-		kernel qdisc q napi nrules run pps drops requeues
+	csv_header "kernel,qdisc,queues,napi,run,boot,pps,qdisc_drops,requeues"
+	printf "%-20s %-9s %2s %-8s %4s %10s %10s %9s\n" \
+		kernel qdisc q napi run pps drops requeues
 	for ((r = 1; r <= RUNS; r++)); do
 		for n in $NAPI; do
-			for nr in $NRULES; do
-				run_one "$r" "$nr" "$n"
-			done
+			run_one "$r" "$n"
 		done
 	done
 }
 
-# usage: iperf_one <run> <qdisc> <threaded|softirq>
-iperf_one() {
-	local proto opts mbps tx lost retr rq0 requeues pin=
+# usage: xps <dev> <queue> <cpu>, dev may be in the netns
+xps() {
+	local f=/sys/class/net/$1/queues/tx-$2/xps_cpus m
 
-	setup "$QUEUES" 0 "$3" "$2"
-	[ "$PIN" -eq 1 ] && pin="-A $CPU_TX,$CPU_SRV"
-	[ "$QUEUES" -gt 1 ] && pin="$pin -P $QUEUES"
-	nsx iperf3 -s -D -I "$TMP/iperf.pid" || die "cannot start iperf3 server"
+	m=$(printf %x $((1 << $3)))
+	if [ "$1" = "$B" ]; then
+		nsx sh -c "echo $m > $f"
+	else
+		echo "$m" > "$f"
+	fi
+}
+
+# Sum over the iperf3 outputs of all streams: receiver and sender Mbit/s,
+# lost UDP datagrams in percent and TCP retransmits. Prints nothing when
+# a stream has no result.
+iperf_sum() {
+	awk -v n=$# '
+	function mb(line,   f, i, k) {
+		k = split(line, f)
+		for (i = 2; i <= k; i++)
+			if (f[i] == "Mbits/sec")
+				return i
+		return 0
+	}
+	/receiver$/ { rx[FILENAME] = $0 }
+	/sender$/ { txl[FILENAME] = $0 }
+	END {
+		for (file in rx) {
+			got++
+			k = split(rx[file], f); i = mb(rx[file])
+			mbps += f[i - 1]
+			for (j = i + 1; j <= k; j++)
+				if (f[j] ~ /^[0-9]+\/[0-9]+$/) {
+					split(f[j], lt, "/"); lost += lt[1]; total += lt[2]; udp = 1
+				}
+			k = split(txl[file], f); i = mb(txl[file])
+			tx += f[i - 1]
+			if (f[i + 2] == "sender") {
+				retr += f[i + 1]; tcp = 1
+			}
+		}
+		if (got < n)
+			exit
+		printf "%.0f %.0f %s %s\n", mbps, tx,
+			udp ? sprintf("%.4g", total ? 100 * lost / total : 0) : "-",
+			tcp ? retr : "-"
+	}' "$@"
+}
+
+# usage: iperf_one <run> <qdisc> <threaded|softirq>
+#
+# One iperf3 server and client per stream. When pinned, each client and
+# server has its own CPU. With several queues XPS sends stream i through
+# txq i modulo the queues, so that it reaches the peer's rq and NAPI
+# thread of that queue. The replies take the same queue back from the
+# server's CPU.
+iperf_one() {
+	local proto opts mbps tx lost retr rq0 requeues i pin res pids
+
+	setup "$QUEUES" "$3" "$2"
+	for ((i = 0; i < STREAMS; i++)); do
+		pin=
+		if [ "$PIN" -eq 1 ]; then
+			pin="-A $((CPU_SRV + i))"
+			if [ "$QUEUES" -gt 1 ]; then
+				xps "$A" $((i % QUEUES)) $((CPU_TX + i))
+				xps "$B" $((i % QUEUES)) $((CPU_SRV + i))
+			fi
+		fi
+		# shellcheck disable=SC2086
+		nsx iperf3 -s -D -p $((5201 + i)) $pin -I "$TMP/iperf$i.pid" ||
+			die "cannot start iperf3 server"
+	done
 	sleep 0.5
 	dmesg_mark
 	for proto in tcp udp; do
 		opts=
 		[ $proto = udp ] && opts="-u -b 0 -l 64"
 		rq0=$(qdisc_requeues)
-		# shellcheck disable=SC2086
-		iperf3 -c "$IP_B" -t "$DURATION" -f m $pin $opts > "$TMP/iperf" 2>&1
+		pids=()
+		rm -f "$TMP"/out*
+		for ((i = 0; i < STREAMS; i++)); do
+			pin=
+			[ "$PIN" -eq 1 ] && pin="-A $((CPU_TX + i))"
+			# shellcheck disable=SC2086
+			iperf3 -c "$IP_B" -p $((5201 + i)) -t "$DURATION" -f m $pin \
+				$opts > "$TMP/out$i" 2>&1 &
+			pids+=($!)
+		done
+		wait "${pids[@]}"
 		requeues=$(qdisc_requeues)
 		[ -n "$rq0" ] && [ -n "$requeues" ] && requeues=$((requeues - rq0))
-		# With several streams the [SUM] line comes last
-		mbps=$(sed -n 's/.* \([0-9.]*\) Mbits\/sec.*receiver.*/\1/p' "$TMP/iperf" | tail -1)
-		tx=$(sed -n 's/.* \([0-9.]*\) Mbits\/sec.*sender.*/\1/p' "$TMP/iperf" | tail -1)
-		lost= retr=
-		if [ $proto = udp ]; then
-			# Datagrams lost between sender and receiver
-			lost=$(sed -n 's/.*(\([0-9.e+-]*\)%) *receiver.*/\1/p' "$TMP/iperf" | tail -1)
-		else
-			retr=$(sed -n 's/.* Mbits\/sec *\([0-9]*\) *sender.*/\1/p' "$TMP/iperf" | tail -1)
-		fi
-		if [ -z "$mbps" ]; then
+		res=$(iperf_sum "$TMP"/out*)
+		read -r mbps tx lost retr <<< "${res:-- - - -}"
+		[ "$proto" = udp ] && retr=
+		[ "$proto" = tcp ] && lost=
+		if [ -z "$res" ]; then
 			echo "FAIL: iperf3 $proto:" >&2
-			tail -3 "$TMP/iperf" >&2
+			tail -n 3 "$TMP"/out* >&2
+			mbps= tx=
 			FAIL=1
 		fi
-		printf "%-20s %-9s %2s %-8s %-5s %4s %10s %10s %6s %6s %9s\n" \
-			"$LABEL" "$2" "$QUEUES" "$3" $proto "$1" "${mbps:--}" "${tx:--}" \
-			"${lost:--}" "${retr:--}" "${requeues:--}"
-		[ -n "$CSV" ] && echo "$LABEL,$2,$QUEUES,$3,$proto,$1,$BOOT,$mbps,$tx,$lost,$retr,$requeues" >> "$CSV"
+		printf "%-20s %-9s %2s %2s %-8s %-5s %4s %10s %10s %6s %6s %9s\n" \
+			"$LABEL" "$2" "$QUEUES" "$STREAMS" "$3" $proto "$1" "${mbps:--}" \
+			"${tx:--}" "${lost:--}" "${retr:--}" "${requeues:--}"
+		[ -n "$CSV" ] && echo "$LABEL,$2,$QUEUES,$STREAMS,$3,$proto,$1,$BOOT,$mbps,$tx,$lost,$retr,$requeues" >> "$CSV"
 	done
 	end_checks
 	teardown
@@ -479,9 +571,9 @@ iperf() {
 	local r c
 
 	command -v iperf3 >/dev/null || die "iperf3 not found"
-	csv_header "kernel,qdisc,queues,napi,proto,run,boot,mbps,tx_mbps,udp_lost_pct,tcp_retr,requeues"
-	printf "%-20s %-9s %2s %-8s %-5s %4s %10s %10s %6s %6s %9s\n" kernel \
-		qdisc q napi proto run Mbit/s "tx Mbit/s" lost% retr requeues
+	csv_header "kernel,qdisc,queues,streams,napi,proto,run,boot,mbps,tx_mbps,udp_lost_pct,tcp_retr,requeues"
+	printf "%-20s %-9s %2s %2s %-8s %-5s %4s %10s %10s %6s %6s %9s\n" kernel \
+		qdisc q s napi proto run Mbit/s "tx Mbit/s" lost% retr requeues
 	for ((r = 1; r <= RUNS; r++)); do
 		for c in "noqueue softirq" "$QDISC softirq" "$QDISC threaded"; do
 			[[ " $NAPI " == *" ${c#* } "* ]] || continue
@@ -514,7 +606,7 @@ stress() {
 	PIN=0
 	CPU_TX=0
 	QUEUES=$(( $(nproc) < 4 ? $(nproc) : 4 ))
-	setup 4 "${NRULES%% *}" threaded
+	setup 4 threaded
 	dmesg_mark
 	pktgen_start
 	end=$((SECONDS + DURATION))
@@ -550,10 +642,10 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 	--duration)	DURATION=$2; shift ;;
 	--qdisc)	QDISC=$2; shift ;;
-	--nrules)	NRULES=$2; shift ;;
 	--napi)		NAPI=$2; shift ;;
 	--runs)		RUNS=$2; shift ;;
 	--queues)	QUEUES=$2; shift ;;
+	--streams)	STREAMS=$2; shift ;;
 	--size)		PKT_SIZE=$2; shift ;;
 	--no-pin)	PIN=0 ;;
 	--label)	LABEL=$2; shift ;;
@@ -573,11 +665,13 @@ for n in $NAPI; do
 	esac
 done
 [ "$(id -u)" -eq 0 ] || die "must run as root"
-for c in ip tc ethtool ping iptables-restore modprobe pgrep taskset; do
+for c in ip tc ethtool ping modprobe pgrep taskset; do
 	command -v $c >/dev/null || die "$c not found"
 done
-CPU_SRV=$((CPU_TX + QUEUES))
-CPU_NAPI=$((CPU_SRV + 1))
+STREAMS=${STREAMS:-$QUEUES}
+[ "$MODE" = iperf ] && NPROD=$STREAMS || NPROD=$QUEUES
+CPU_SRV=$((CPU_TX + NPROD))
+CPU_NAPI=$((CPU_SRV + NPROD))
 if [ "$PIN" -eq 1 ] && [ "$MODE" != stress ]; then
 	[ "$(nproc)" -ge $((CPU_NAPI + QUEUES)) ] ||
 		die "pinning $QUEUES queue(s) needs $((CPU_NAPI + QUEUES)) CPUs, use --no-pin"
