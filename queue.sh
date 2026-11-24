@@ -5,11 +5,12 @@
 # it once inside the benchmark partition, so that the jobs can use its
 # CPUs without sudo:
 #
-#   sudo setsid -f ./bench-mode.sh run ./queue.sh
+#   sudo setsid -f ./bench-mode.sh run ./queue.sh < /dev/null > queue/start.log 2>&1
 #
+# Without the redirections, sudo with use_pty ends the queue when it exits.
 # A job is any bash script, e.g. queue/01-pktgen.sh with a vng.sh command.
-# Its output goes to queue/<name>.log, and it moves to queue/done/ when it
-# ends. touch queue/stop ends the queue after the running job.
+# It moves to queue/done/ when it starts, and its output goes to
+# queue/<name>.log. touch queue/stop ends the queue after the running job.
 
 set -u
 

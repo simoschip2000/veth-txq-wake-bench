@@ -119,11 +119,13 @@ sudo ./bench-mode.sh run ./vng.sh --boots 10 --host-cpus 8-15 ~/base ~/wake -- -
 
 `run` drops back to the calling user. To queue jobs without sudo, start
 `queue.sh` once inside the partition and put job scripts into `queue/`.
-Write a job under another name first and rename it, so that the queue
-does not pick it up half written:
+Redirect its input and output, as sudo with `use_pty`, the default on
+Ubuntu, ends a queue that is still attached to its terminal. Write a job
+under another name first and rename it, so that the queue does not pick
+it up half written:
 
 ```bash
-sudo setsid -f ./bench-mode.sh run ./queue.sh
+sudo setsid -f ./bench-mode.sh run ./queue.sh < /dev/null > queue/start.log 2>&1
 echo './vng.sh --boots 10 --host-cpus 8-15 ~/base ~/wake' > queue/01-pktgen.tmp
 mv queue/01-pktgen.tmp queue/01-pktgen.sh
 touch queue/stop                 # ends the queue after the running job
