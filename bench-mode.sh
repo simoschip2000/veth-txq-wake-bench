@@ -50,15 +50,22 @@ expand() {
 	done
 }
 
-# Hex mask of the CPUs on stdin
+# Hex mask of the CPUs on stdin, in comma separated words of 32 CPUs as
+# the kernel prints and parses cpumasks, so any number of CPUs works
 mask() {
-	local c m=0
+	local c i n=1 out=
+	local -a w=()
 
 	while read -r c; do
-		[ "$c" -lt 63 ] || die "CPU $c: only 63 CPUs supported"
-		m=$((m | 1 << c))
+		i=$((c / 32))
+		w[i]=$(( ${w[i]:-0} | 1 << (c % 32) ))
+		[ "$i" -lt "$n" ] || n=$((i + 1))
 	done
-	printf "%x\n" $m
+	for ((i = n - 1; i >= 0; i--)); do
+		out+=$(printf %08x "${w[i]:-0}")
+		[ "$i" -eq 0 ] || out+=,
+	done
+	echo "$out"
 }
 
 # Online CPUs that are not in the partition

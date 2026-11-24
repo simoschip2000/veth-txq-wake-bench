@@ -44,7 +44,7 @@ A=veth_tw0
 B=veth_tw1
 IP_B=10.99.0.2
 PG=/proc/net/pktgen
-TMP=$(mktemp -d)
+TMP=
 BOOT=$(cut -c1-8 /proc/sys/kernel/random/boot_id)
 PG_PID=
 FAIL=0
@@ -322,7 +322,7 @@ dmesg_check() {
 	local bad
 
 	bad=$(dmesg | tail -n +$((DMESG_LINES + 1)) |
-	      grep -E 'BUG|WARNING|Oops|NETDEV WATCHDOG|asks to queue packet')
+	      grep -E 'BUG|WARNING|Oops|Out of memory|NETDEV WATCHDOG|asks to queue packet')
 	[ -z "$bad" ] && return 0
 	echo "FAIL: kernel reported:" >&2
 	echo "$bad" | head -20 >&2
@@ -415,22 +415,31 @@ qdisc_requeues() {
 	tc -s qdisc show dev "$A" | sed -n 's/.* requeues \([0-9]*\)).*/\1/p' | head -1
 }
 
+# Drops of the root qdisc of veth_tw0 so far
+qdisc_drops() {
+	tc -s qdisc show dev "$A" | sed -n 's/.*(dropped \([0-9]*\),.*/\1/p' | head -1
+}
+
 # usage: run_one <run> <threaded|softirq>
 run_one() {
-	local rx0 rx1 t0 t1 pps drops requeues
+	local rx0 rx1 t0 t1 pps dr0 drops rq0 requeues
 
 	setup "$QUEUES" "$2"
 	dmesg_mark
 	pktgen_start
 	sleep 1
+	# Drops and requeues of the same --duration as pps, without the start
 	rx0=$(nsx cat /sys/class/net/$B/statistics/rx_packets)
 	t0=$(date +%s%N)
+	dr0=$(qdisc_drops)
+	rq0=$(qdisc_requeues)
 	sleep "$DURATION"
 	rx1=$(nsx cat /sys/class/net/$B/statistics/rx_packets)
 	t1=$(date +%s%N)
-	drops=$(tc -s qdisc show dev "$A" |
-		sed -n 's/.*(dropped \([0-9]*\),.*/\1/p' | head -1)
+	drops=$(qdisc_drops)
 	requeues=$(qdisc_requeues)
+	[ -n "$dr0" ] && [ -n "$drops" ] && drops=$((drops - dr0))
+	[ -n "$rq0" ] && [ -n "$requeues" ] && requeues=$((requeues - rq0))
 	end_checks
 	teardown
 	dmesg_check
@@ -680,6 +689,7 @@ if [ "$PIN" -eq 1 ] && [ "$MODE" != stress ]; then
 fi
 [ "$PIN" -eq 1 ] || [ "$(nproc)" -ge $((CPU_TX + QUEUES)) ] ||
 	die "$QUEUES pktgen threads need $((CPU_TX + QUEUES)) CPUs"
+TMP=$(mktemp -d) || die "mktemp failed"
 trap 'teardown; rm -rf "$TMP"' EXIT
 teardown
 

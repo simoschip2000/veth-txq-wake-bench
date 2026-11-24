@@ -7,7 +7,7 @@
 # worse from the console, go to results/<timestamp>/, followed by the
 # averages of all boots.
 #
-# Usage: vng.sh [--boots N] [--cpus N] [--host-cpus LIST] TREE [TREE...] [-- veth_bench.sh options]
+# Usage: vng.sh [--boots N] [--cpus N] [--memory SIZE] [--host-cpus LIST] TREE [TREE...] [-- veth_bench.sh options]
 #
 # --host-cpus pins the VM to host CPUs, e.g. 8-15, so that other load on
 # the host disturbs it less. The first --cpus of them run one vCPU each,
@@ -15,6 +15,9 @@
 # milliseconds. So give it more host CPUs than --cpus. Their frequency
 # governor should be performance, see bench-mode.sh, which also keeps
 # everything else off them.
+#
+# --memory sets the memory of the VM, 2G by default. A KASAN kernel can
+# need more under the pktgen flood of --stress.
 #
 # Examples:
 #   ./vng.sh ~/net-next -- --stress
@@ -25,8 +28,10 @@ set -u
 
 BOOTS=1
 CPUS=4
+MEMORY=2G
 HOST_CPUS=
 TREES=()
+CMDLINE=$(printf '%q ' "$0" "$@")
 
 usage() {
 	sed -n 's/^# Usage: //p' "$0"
@@ -37,6 +42,7 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 	--boots)	BOOTS=$2; shift 2 ;;
 	--cpus)		CPUS=$2; shift 2 ;;
+	--memory)	MEMORY=$2; shift 2 ;;
 	--host-cpus)	HOST_CPUS=$2; shift 2 ;;
 	--)		shift; break ;;
 	-*)		usage ;;
@@ -49,9 +55,14 @@ command -v vng >/dev/null || { echo "vng not found" >&2; exit 1; }
 DIR=$(cd "$(dirname "$0")" && pwd)
 OUT=$DIR/results/$(date +%Y-%m-%dT%H-%M-%S)
 CSV=$OUT/results.csv
-ARGS=$(printf ' %q' "$@")
+# printf would turn no arguments into one empty argument
+ARGS=
+[ $# -gt 0 ] && ARGS=$(printf ' %q' "$@")
 mkdir -p "$OUT"
-echo "$0 $*" > "$OUT/cmdline"
+{
+	echo "${CMDLINE% }"
+	echo "veth-bench $(git -C "$DIR" describe --always --dirty 2>/dev/null || echo -)"
+} > "$OUT/cmdline"
 
 for t in "${TREES[@]}"; do
 	[ -f "$t/vmlinux" ] || { echo "$t: no vmlinux, build it first" >&2; exit 1; }
@@ -118,7 +129,7 @@ for i in "${!TREES[@]}"; do
 done | tee "$OUT/kernels"
 
 # Console lines only, vng prints its own warnings without a timestamp
-KERNEL_BAD='^\[ *[0-9]+\.[0-9]+\] .*(BUG:|WARNING:|Oops|Kernel panic|NETDEV WATCHDOG)'
+KERNEL_BAD='^\[ *[0-9]+\.[0-9]+\] .*(BUG:|WARNING:|Oops|Kernel panic|NETDEV WATCHDOG|Out of memory)'
 FAIL=0
 
 for ((b = 1; b <= BOOTS; b++)); do
@@ -126,7 +137,7 @@ for ((b = 1; b <= BOOTS; b++)); do
 		name=${LABELS[$i]}-$b
 		echo "=== boot $b/$BOOTS: ${LABELS[$i]} (${TREES[$i]})"
 		(cd "${TREES[$i]}" &&
-		 "${PIN_CMD[@]}" vng --verbose --cpus "$CPUS" "${PIN_ARGS[@]}" --memory 2G \
+		 "${PIN_CMD[@]}" vng --verbose --cpus "$CPUS" "${PIN_ARGS[@]}" --memory "$MEMORY" \
 			--rwdir "$OUT" --append "panic=5 loglevel=5" \
 			--exec "$DIR/veth_bench.sh --label ${LABELS[$i]} --csv $CSV$ARGS") \
 			2>&1 | tee "$OUT/$name.log"
