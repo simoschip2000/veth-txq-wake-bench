@@ -1,0 +1,105 @@
+From 2c5622ab1ff2cbba15905be590fa01ef654b5c23 Mon Sep 17 00:00:00 2001
+From: Simon Schippers <simon.schippers@tu-dortmund.de>
+Date: Tue, 24 Nov 2026 14:51:51 +0100
+Subject: [PATCH net-next 3/3] veth: stop the txq as soon as the ptr_ring is
+ full
+
+veth_xmit() stops the txq only once a produce has failed. The skb is
+then returned with NETDEV_TX_BUSY and requeued by the qdisc. Under a
+flood every refill of the ring after a wake ends this way, with a failed
+produce and a requeue.
+
+Check under the producer lock whether the produce has filled the ring,
+and stop the txq then, as for NETDEV_TX_BUSY but with the skb sent. The
+next skb waits in the qdisc and is not requeued. NETDEV_TX_BUSY stays
+for a ring that another producer, like XDP redirect, has filled.
+
+The stop is ordered as in the NETDEV_TX_BUSY path. The stop bit is set
+before the smp_mb() in __veth_xdp_flush(), which pairs with the
+smp_store_mb() in veth_poll(). Either the producer finds NAPI idle and
+schedules it, or the poll sees the stopped txq and wakes it.
+
+Same setup as in the previous patch, an AMD Ryzen 9 9950X with all
+cores on the same CCX at a fixed 4.3 GHz, compared to it:
+
+  threaded NAPI     before          after           requeues
+  pktgen            1343008 pps      +0.2 +-0.4%     210594 -> 0
+  iperf3 TCP          33113 Mbit/s   +0.1 +-0.4%       4587 -> 3213
+  iperf3 UDP            363 Mbit/s   +1.2 +-0.6%         14 -> 14
+
+iperf3 TCP keeps its requeues, the change is within noise. When the txq
+stops in the middle of a GSO segment list, the rest of the list goes
+back to the qdisc, and each segment counts as a requeue. The few UDP
+requeues show up with every kernel, also without this series.
+
+With softirq NAPI and a single sender the ring does not fill, and the
+only change on that path is the __ptr_ring_check_produce() check.
+iperf3 changes by -0.1% to +0.4% there, with confidence intervals of
+0.4% to 0.9%.
+pktgen is 1.4 +-0.5% slower. The patch also moves the code of net/ by
+16 bytes, as veth is linked before it, and I could not separate the
+two.
+
+With the two iperf3 senders on one queue from the previous patch,
+throughput stays within 1.2% of it. The UDP requeues with threaded NAPI
+drop from 81520 to 48929 per run.
+
+Signed-off-by: Simon Schippers <simon.schippers@tu-dortmund.de>
+---
+ drivers/net/veth.c | 25 ++++++++++++++++++++++---
+ 1 file changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/veth.c b/drivers/net/veth.c
+index 02ffc7ba59ab2..911da9893e82d 100644
+--- a/drivers/net/veth.c
++++ b/drivers/net/veth.c
+@@ -40,6 +40,11 @@
+ #define VETH_XDP_TX_BULK_SIZE	16
+ #define VETH_XDP_BATCH		16
+ 
++/* Returned by veth_xdp_rx() when the skb filled the ring. Internal to
++ * veth, veth_xmit() returns NETDEV_TX_OK for it.
++ */
++#define VETH_RING_FULL		0x20
++
+ struct veth_stats {
+ 	u64	rx_drops;
+ 	/* xdp */
+@@ -312,10 +317,17 @@ static void __veth_xdp_flush(struct veth_rq *rq)
+ 
+ static int veth_xdp_rx(struct veth_rq *rq, struct sk_buff *skb)
+ {
+-	if (unlikely(ptr_ring_produce(&rq->xdp_ring, skb)))
+-		return NETDEV_TX_BUSY; /* signal qdisc layer */
++	struct ptr_ring *ring = &rq->xdp_ring;
++	int ret = NET_RX_SUCCESS; /* same as NETDEV_TX_OK */
+ 
+-	return NET_RX_SUCCESS; /* same as NETDEV_TX_OK */
++	spin_lock(&ring->producer_lock);
++	if (__ptr_ring_produce(ring, skb))
++		ret = NETDEV_TX_BUSY; /* signal qdisc layer */
++	else if (__ptr_ring_check_produce(ring) == -ENOSPC)
++		ret = VETH_RING_FULL;
++	spin_unlock(&ring->producer_lock);
++
++	return ret;
+ }
+ 
+ static int veth_forward_skb(struct net_device *dev, struct sk_buff *skb,
+@@ -388,6 +400,13 @@ static netdev_tx_t veth_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		else
+ 			__veth_xdp_flush(rq);
+ 		break;
++	case VETH_RING_FULL:
++		txq = netdev_get_tx_queue(dev, rxq);
++		if (!qdisc_txq_has_no_queue(txq))
++			netif_tx_stop_queue(txq);
++		__veth_xdp_flush(rq);
++		ret = NETDEV_TX_OK;
++		break;
+ 	case NETDEV_TX_BUSY:
+ 		/* If a qdisc is attached to our virtual device, returning
+ 		 * NETDEV_TX_BUSY is allowed.
+-- 
+2.43.0
+

@@ -1,0 +1,73 @@
+From 2c5622ab1ff2cbba15905be590fa01ef654b5c23 Mon Sep 17 00:00:00 2001
+From: Simon Schippers <simon.schippers@tu-dortmund.de>
+Date: Wed, 25 Nov 2026 08:28:08 +0100
+Subject: [PATCH net-next 0/3] veth: earlier txq wake and stop under
+ backpressure
+
+While working on the veth BQL series [1], I noticed that veth was
+sometimes faster with BQL enabled than without it. Debugging this showed
+two reasons, both in how veth handles a full ptr_ring since commit
+dc82a33297fc ("veth: apply qdisc backpressure on full ptr_ring to reduce
+TX drops"):
+
+- With BQL, the completions inside the NAPI loop wake the txq in the
+  middle of the poll. Without BQL, veth_poll() wakes the stopped peer
+  txq only at the end of the poll. The wake raises NET_TX_SOFTIRQ on the
+  consumer CPU, which then refills the ring from the qdisc itself
+  instead of consuming. Patch 2 wakes the txq in the middle of the poll,
+  so that the producer refills the ring on its own CPU. Patch 1 adds
+  PTR_RING_BATCH, which sets the wake point.
+
+- With BQL, veth_xmit() stops the txq after a successful produce.
+  Without BQL, it stops the txq only after a produce has failed, so
+  every refill ends with NETDEV_TX_BUSY and a requeue, which adds up to
+  many requeues under a flood. Patch 3 stops the txq as soon as the
+  ring is full, with a __ptr_ring_check_produce() right after the
+  produce, as in my tun patch [2].
+
+Here are some highlights for the whole series against net-next, with
+fq_codel on a veth pair with GRO on and TSO off, so that all traffic
+takes the NAPI ptr_ring path, as with an XDP program on the peer. In a
+virtme-ng VM on isolated host CPUs at a fixed frequency, 95% confidence
+intervals over 50 boots per kernel, 40 boots for two senders:
+
+  one sender, threaded NAPI     net-next        series
+  pktgen, 64 byte UDP           1078122 pps     +24.8 +-0.5%
+  iperf3 TCP                      32682 Mbit/s   +1.4 +-0.6%
+  iperf3 UDP, 64 byte               362 Mbit/s   +1.4 +-0.5%
+
+  two iperf3 senders, one queue
+  TCP, softirq NAPI               25798 Mbit/s  +51.9 +-0.8%
+  TCP, threaded NAPI              22480 Mbit/s  +15.0 +-1.2%
+  UDP, threaded NAPI                701 Mbit/s  +15.2 +-0.5%
+
+With a single sender and softirq NAPI the consumer runs on the sender's
+CPU and the ring does not fill. iperf3 stays within 0.4% there, and
+pktgen is 1.8% slower, which I could not separate from a shift of the
+code layout, see patch 3. No other regressions were found.
+
+With two senders and softirq NAPI, TCP through fq_codel was 36% slower
+than with noqueue. With this series the gap is 2%.
+
+The measurement setup, the test scripts, the isolation of the host CPUs
+and the benchmark runs, were done with Claude Code (Claude Opus 5.5).
+The scripts are in [3].
+
+[1] https://lore.kernel.org/netdev/20260612083530.1650245-1-hawk@kernel.org/
+[2] https://lore.kernel.org/netdev/20260803183641.96882-1-simon.schippers@tu-dortmund.de/
+[3] https://github.com/simoschip2000/veth-txq-wake-bench
+
+Simon Schippers (3):
+  ptr_ring: add PTR_RING_BATCH
+  veth: wake the peer txq in the middle of the NAPI poll
+  veth: stop the txq as soon as the ptr_ring is full
+
+ drivers/net/veth.c       | 52 +++++++++++++++++++++++++++++++++-------
+ include/linux/ptr_ring.h |  7 +++++-
+ 2 files changed, 50 insertions(+), 9 deletions(-)
+
+
+base-commit: 612848d37e68b858e15815175f1c5e609e09d719
+-- 
+2.43.0
+

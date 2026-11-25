@@ -5,7 +5,8 @@ and checked by the author.
 
 Benchmark and stress check for veth with a qdisc, written for the veth
 series that changes how the NAPI consumer wakes the sender's txq and how
-the sender stops it.
+the sender stops it. The patches of that series and the runs for its
+numbers are in [veth-txq-wake/](veth-txq-wake/).
 
 | File            | Description                                                     |
 |-----------------|-----------------------------------------------------------------|

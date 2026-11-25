@@ -1,0 +1,138 @@
+From b2348116b44f9d0a2aec5afc0b045f24cb233d08 Mon Sep 17 00:00:00 2001
+From: Simon Schippers <simon.schippers@tu-dortmund.de>
+Date: Tue, 24 Nov 2026 14:51:51 +0100
+Subject: [PATCH net-next 2/3] veth: wake the peer txq in the middle of the
+ NAPI poll
+
+Since commit dc82a33297fc ("veth: apply qdisc backpressure on full
+ptr_ring to reduce TX drops") veth_poll() wakes a stopped peer txq at the
+end of every poll. netif_tx_wake_queue() raises NET_TX_SOFTIRQ on the
+local CPU, and it runs right after the poll when BHs are enabled again.
+The consumer CPU then dequeues from the qdisc and refills the ring
+itself, while the producer finds the qdisc running or the txq stopped
+again. Under a flood the consumer spends that time on the refill instead
+of on consuming.
+
+Wake the txq after PTR_RING_BATCH entries of the poll instead, if it
+was stopped when the poll started. That is 16 on 64-bit architectures
+with 64 byte cache lines. The softirq then stays pending until the poll
+ends, and the producer refills the ring on its own CPU while the
+consumer goes on. All entries consumed by then were consumed after the
+stop, so the ptr_ring has freed at least one batch of slots and the
+producer does not find it full again right away.
+
+At the end of the poll the txq is woken only when the ring has run dry,
+so that NAPI does not go idle with the txq stopped. A stop during a poll
+is picked up by the next one. Budgets up to PTR_RING_BATCH, as with busy
+polling, cannot consume a batch before the wake and keep the wake at the
+end of every poll.
+
+The position of the wake is what matters. Waking only at the end of a
+poll, once 128 entries had been consumed with the txq stopped, gave
+about 3% in a short pktgen test, against about 25% for the wake in the
+middle of the poll.
+
+pktgen (64 byte UDP, queue_xmit) and iperf3 into fq_codel on a veth pair
+with GRO on and TSO off, so that all traffic takes the NAPI ptr_ring
+path, as with an XDP program on the peer. In a virtme-ng VM with 4 vCPUs
+pinned to isolated cores of an AMD Ryzen 9 9950X, all on the same CCX,
+at a fixed 4.3 GHz. 50 boots per kernel, 95% confidence intervals, with
+the qdisc requeues per 10 s run:
+
+  threaded NAPI     before          after           requeues
+  pktgen            1078122 pps     +24.6 +-0.5%     169038 -> 210594
+  iperf3 TCP          32682 Mbit/s   +1.3 +-0.7%     579184 -> 4587
+  iperf3 UDP            362 Mbit/s   +0.2 +-0.5%         14 -> 14
+
+pktgen requeues one skb per 64 packets, before and after. The next patch
+removes these requeues.
+
+With softirq NAPI and a single sender the consumer runs on the sender's
+CPU and the ring does not fill. The changes of pktgen and iperf3 there
+range from -0.7% to +0.4%, with confidence intervals of 0.4% to 0.9%.
+
+With two iperf3 senders on one queue, each on its own CPU, the ring
+fills with softirq NAPI too. 40 boots per kernel, 6 vCPUs:
+
+  two senders       before          after           requeues
+  TCP, softirq        25798 Mbit/s  +52.1 +-0.9%    6024998 -> 799805
+  TCP, threaded       22480 Mbit/s  +16.4 +-1.8%    6741008 -> 5910785
+  UDP, threaded         701 Mbit/s  +14.4 +-0.5%     152298 -> 81520
+
+With softirq NAPI, TCP through fq_codel was 36% slower than with
+noqueue before and is 2% slower after.
+
+A wake after 32 entries instead of 16 gave the same throughput, except
+for TCP with two senders and threaded NAPI, which gained only 8.3%.
+
+Signed-off-by: Simon Schippers <simon.schippers@tu-dortmund.de>
+---
+ drivers/net/veth.c | 27 ++++++++++++++++++++++-----
+ 1 file changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/veth.c b/drivers/net/veth.c
+index 2051f6e044327..02ffc7ba59ab2 100644
+--- a/drivers/net/veth.c
++++ b/drivers/net/veth.c
+@@ -912,11 +912,19 @@ static struct sk_buff *veth_xdp_rcv_skb(struct veth_rq *rq,
+ 
+ static int veth_xdp_rcv(struct veth_rq *rq, int budget,
+ 			struct veth_xdp_tx_bq *bq,
+-			struct veth_stats *stats)
++			struct veth_stats *stats,
++			struct netdev_queue *peer_txq)
+ {
+-	int i, done = 0, n_xdpf = 0;
++	int i, done = 0, n_xdpf = 0, wake_at = 0;
+ 	void *xdpf[VETH_XDP_BATCH];
+ 
++	/* Wake a stopped peer txq in the middle of the poll, so that the
++	 * producer refills the ring while this poll goes on.
++	 */
++	if (budget > PTR_RING_BATCH && peer_txq &&
++	    netif_tx_queue_stopped(peer_txq))
++		wake_at = PTR_RING_BATCH;
++
+ 	for (i = 0; i < budget; i++) {
+ 		void *ptr = __ptr_ring_consume(&rq->xdp_ring);
+ 
+@@ -952,6 +960,11 @@ static int veth_xdp_rcv(struct veth_rq *rq, int budget,
+ 			}
+ 		}
+ 		done++;
++
++		if (done == wake_at) {
++			txq_trans_cond_update(peer_txq);
++			netif_tx_wake_queue(peer_txq);
++		}
+ 	}
+ 
+ 	if (n_xdpf)
+@@ -988,7 +1001,7 @@ static int veth_poll(struct napi_struct *napi, int budget)
+ 		   netdev_get_tx_queue(peer_dev, queue_idx) : NULL;
+ 
+ 	xdp_set_return_frame_no_direct();
+-	done = veth_xdp_rcv(rq, budget, &bq, &stats);
++	done = veth_xdp_rcv(rq, budget, &bq, &stats, peer_txq);
+ 
+ 	if (stats.xdp_redirect > 0)
+ 		xdp_do_flush();
+@@ -1007,9 +1020,13 @@ static int veth_poll(struct napi_struct *napi, int budget)
+ 		}
+ 	}
+ 
+-	/* Release backpressure per NAPI poll */
++	/* Release backpressure before NAPI may go idle, and after every poll
++	 * that veth_xdp_rcv() cannot wake in the middle of
++	 */
+ 	smp_rmb(); /* Paired with netif_tx_stop_queue set_bit */
+-	if (peer_txq && netif_tx_queue_stopped(peer_txq)) {
++	if (peer_txq && netif_tx_queue_stopped(peer_txq) &&
++	    (budget <= PTR_RING_BATCH || done < budget ||
++	     __ptr_ring_empty(&rq->xdp_ring))) {
+ 		txq_trans_cond_update(peer_txq);
+ 		netif_tx_wake_queue(peer_txq);
+ 	}
+-- 
+2.43.0
+
